@@ -1,0 +1,226 @@
+// src/App.jsx
+
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, collection, addDoc, onSnapshot, query, orderBy, serverTimestamp, doc, setDoc, updateDoc } from 'firebase/firestore';
+
+// Global variables provided by the environment
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Your web app's Firebase configuration
+const firebaseConfig = {
+  apiKey: "AIzaSyAdVEeT-s3ntU-pSMZjuKn0L_QfLZ5rrQ4",
+  authDomain: "soham1-d7160.firebaseapp.com",
+  projectId: "soham1-d7160",
+  storageBucket: "soham1-d7160.appspot.com",
+  messagingSenderId: "985780312938",
+  appId: "1:985780312938:web:76b4cc60a50f9cb02ba313",
+  measurementId: "G-1DTWNZGQB0"
+};
+
+// --- START: API KEYS AND CONFIGURATION ---
+const GEMINI_API_KEY = "AIzaSyDKVxGXSzQL5_du05FkTuyeQl5St_0MYbM";
+const ALPHA_VANTAGE_KEY = "6RKTJK2BFKQWX9QC";
+const COINGECKO_API_BASE = "https://api.coingecko.com/api/v3";
+// --- END: API KEYS AND CONFIGURATION ---
+
+function App() {
+  const [messages, setMessages] = useState([]);
+  const [userInput, setUserInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [userId, setUserId] = useState('');
+  const [typoWarning, setTypoWarning] = useState(null);
+  const [chatList, setChatList] = useState([]);
+  const [currentChatId, setCurrentChatId] = useState(null);
+  const chatMessagesRef = useRef(null);
+  const userInputRef = useRef(null);
+  const db = useRef(null);
+  const auth = useRef(null);
+
+  const showModal = (message, isWarning = false) => {
+    if (isWarning) setTypoWarning(message);
+    else setError(message);
+  };
+
+  const levenshteinDistance = (a, b) => {
+    const matrix = Array.from({ length: b.length + 1 }, (_, i) => [i]);
+    for (let j = 1; j <= a.length; j++) matrix[0][j] = j;
+    for (let i = 1; i <= b.length; i++) {
+      for (let j = 1; j <= a.length; j++) {
+        const cost = b[i - 1] === a[j - 1] ? 0 : 1;
+        matrix[i][j] = Math.min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j - 1] + cost);
+      }
+    }
+    return matrix[b.length][a.length];
+  };
+  
+  const checkTypo = (input) => {
+    const greetings = ["hello", "hi", "hey", "greetings"];
+    const inputWord = input.toLowerCase().trim();
+    if (inputWord.split(' ').length > 1 || inputWord.length < 2) return null;
+    for (const greeting of greetings) {
+      if (inputWord.length >= greeting.length - 1 && inputWord.length <= greeting.length + 1) {
+        if (levenshteinDistance(inputWord, greeting) <= 1) {
+          return `Did you mean to type "${greeting}"?`;
+        }
+      }
+    }
+    return null;
+  };
+
+  // --- START: LLM-POWERED HELPER FUNCTIONS ---
+
+  const correctUserTypo = async (prompt) => {
+    if (prompt.trim().split(' ').length <= 2) return prompt.trim();
+    const systemPrompt = `You are a helpful assistant that corrects spelling and grammar mistakes in user queries for a financial chatbot. Only return the corrected query. Do not answer the question. For example, if the user types "what is market status tyoday", you should only return "what is market status today".`;
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${GEMINI_API_KEY}`;
+    const payload = { contents: [{ parts: [{ text: `${systemPrompt}\n\nUser query: "${prompt}"` }] }] };
+    try {
+      const response = await fetch(apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      const result = await response.json();
+      const correctedText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+      return correctedText ? correctedText.trim().replace(/"/g, '') : prompt;
+    } catch (error) {
+      console.error("Typo correction failed:", error);
+      return prompt;
+    }
+  };
+
+  const getCurrencyCodesFromText = async (prompt) => {
+    const systemPrompt = `You are an expert financial entity extractor. From the user's query, extract the two standard ISO 4217 currency codes being discussed. For example, if the query is "how many rupees is one dollar", you must return "USD to INR". If it's "euro vs yen", return "EUR to JPY". Only return the codes in the format "CODE1 to CODE2".`;
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${GEMINI_API_KEY}`;
+    const payload = { contents: [{ parts: [{ text: `${systemPrompt}\n\nUser query: "${prompt}"` }] }] };
+    try {
+        const response = await fetch(apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        const result = await response.json();
+        const extractedText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+        return extractedText ? extractedText.trim() : null;
+    } catch (error) {
+        console.error("Currency code extraction failed:", error);
+        return null;
+    }
+  };
+
+  // --- END: LLM-POWERED HELPER FUNCTIONS ---
+
+  const generateContent = async (userPrompt) => { /* ... existing code ... */ };
+  const fetchStockData = async (prompt) => { /* ... existing code ... */ };
+  const fetchCryptoData = async (prompt) => { /* ... existing code ... */ };
+  const fetchIndianStockData = async (prompt) => { /* ... existing code ... */ };
+  
+  // UPGRADED Forex Data Fetcher
+  const fetchForexData = async (prompt) => {
+    let currencyMatch = await getCurrencyCodesFromText(prompt);
+
+    if (!currencyMatch) {
+        const regexMatch = prompt.toUpperCase().match(/([A-Z]{3})\s*(?:TO|\/)\s*([A-Z]{3})/);
+        if (regexMatch) {
+            currencyMatch = `${regexMatch[1]} to ${regexMatch[2]}`;
+        } else {
+            return "I couldn't identify the currencies in your request. Please use standard codes like 'USD to INR' or natural language like 'dollar to rupee'.";
+        }
+    }
+
+    const [from_currency, to_currency] = currencyMatch.split(/\s*to\s*/i);
+    
+    const url = `https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency=${from_currency.trim()}&to_currency=${to_currency.trim()}&apikey=${ALPHA_VANTAGE_KEY}`;
+    try {
+        const response = await fetch(url);
+        const data = await response.json();
+        const rateInfo = data["Realtime Currency Exchange Rate"];
+        if (rateInfo) {
+            const exchangeRate = parseFloat(rateInfo['5. Exchange Rate']).toFixed(4);
+            return `The current exchange rate for ${from_currency.trim()} to ${to_currency.trim()} is ${exchangeRate}.`;
+        } else {
+            return "Could not retrieve the exchange rate. The currency codes may be invalid or not supported.";
+        }
+    } catch (error) {
+        return "Sorry, I couldn't connect to the forex data service.";
+    }
+  };
+
+  // UPGRADED Intent Router
+  const handleSendMessage = async (rawMessageText) => {
+    if (!rawMessageText || !userId || !currentChatId || !db.current) return;
+    try {
+      await addDoc(collection(db.current, `artifacts/${firebaseConfig.appId}/users/${userId}/chats/${currentChatId}/messages`), {
+        text: rawMessageText, sender: 'user', timestamp: serverTimestamp()
+      });
+    } catch (e) { console.error("Error adding user message: ", e); return; }
+
+    setIsLoading(true);
+    const correctedMessageText = await correctUserTypo(rawMessageText);
+    const lowerCaseMessage = correctedMessageText.toLowerCase().trim();
+    
+    let botResponse = "";
+
+    const isSingleWordQuery = lowerCaseMessage.split(' ').length <= 2;
+    const hasFinancialKeywords = /\b(stock|price|market|volume|shares|ticker|value|status)\b/.test(lowerCaseMessage);
+
+    if (/\b(reliance|infosys|tcs|infy|hdfcbank|nse|bse)\b/.test(lowerCaseMessage)) {
+        botResponse = await fetchIndianStockData(lowerCaseMessage);
+    } else if (/[a-z]{3}\s*(to|\/)\s*[a-z]{3}/.test(lowerCaseMessage) || /\b(rupee|dollar|euro|yen|pound|currency|exchange rate)\b/.test(lowerCaseMessage)) {
+        botResponse = await fetchForexData(lowerCaseMessage);
+    } else if (/\b(bitcoin|ethereum|crypto|dogecoin|solana|btc|eth)\b/.test(lowerCaseMessage)) {
+        botResponse = await fetchCryptoData(lowerCaseMessage);
+    } else if (isSingleWordQuery || hasFinancialKeywords) {
+        botResponse = await fetchStockData(lowerCaseMessage);
+    } else if (/^\s*(hi|hello|hey|greetings)\s*$/.test(lowerCaseMessage)) {
+        const greetings = ["Hello! How can I assist with market data today?", "Hi there! What can I provide for you?"];
+        botResponse = greetings[Math.floor(Math.random() * greetings.length)];
+    } else {
+        botResponse = await generateContent(correctedMessageText); // Use the corrected text for general queries too
+    }
+    
+    setIsLoading(false);
+
+    if (botResponse) {
+        try {
+          await addDoc(collection(db.current, `artifacts/${firebaseConfig.appId}/users/${userId}/chats/${currentChatId}/messages`), {
+            text: botResponse, sender: 'bot', timestamp: serverTimestamp()
+          });
+        } catch (e) { console.error("Error adding bot response: ", e); }
+    }
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    const userMessage = userInput.trim();
+    if (!userMessage) return;
+    const typo = checkTypo(userMessage);
+    if (typo) {
+      showModal(typo, true);
+      return;
+    }
+    setUserInput('');
+    setTypoWarning(null);
+    if (messages.length === 0 && userMessage.length > 0) {
+      const newTitle = userMessage.length > 30 ? userMessage.substring(0, 30) + '...' : userMessage;
+      try {
+        await updateDoc(doc(db.current, `artifacts/${firebaseConfig.appId}/users/${userId}/chats/${currentChatId}`), { title: newTitle });
+      } catch (e) {
+        console.error("Error updating chat title: ", e);
+      }
+    }
+    handleSendMessage(userMessage);
+  };
+  
+  const handleTypoConfirm = () => {
+    const userMessage = userInput.trim();
+    setUserInput('');
+    setTypoWarning(null);
+    if (!userMessage) return;
+    handleSendMessage(userMessage);
+  };
+
+  // ... rest of your existing React component code (createNewChat, useEffect hooks, JSX rendering) remains the same.
+  // Make sure to copy the unchanged functions for fetchStockData, fetchCryptoData, etc., as noted in the comments.
+  
+  return (
+    // ... your JSX code
+  );
+}
+
+export default App;
